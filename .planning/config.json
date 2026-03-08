@@ -1,0 +1,21 @@
+{
+  "version": "1.0",
+  "project": "MESI Snooping Cache + UVM-lite DV",
+  "workflow": {
+    "commit_style": "atomic_per_phase",
+    "autonomy": "confirm_before_phase",
+    "research_before_requirements": false,
+    "teaching_mode": true,
+    "explain_hardware_concepts": true
+  },
+  "tech": {
+    "language": "SystemVerilog",
+    "simulator": "icarus_verilog",
+    "target": "MiSTer_DE10_Nano_Cyclone_V",
+    "testbench_style": "UVM-lite_no_library"
+  },
+  "status": {
+    "current_phase": 0,
+    "milestone": 1
+  }
+}

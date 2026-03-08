@@ -1,0 +1,41 @@
+# ================================================================
+# Verilator Makefile for RegisterFile Module Test
+# ================================================================
+
+# Verilator configuration
+VERILATOR = /tmp/local_tools/verilator_extract/usr/bin/verilator
+VERILATOR_ROOT = /tmp/local_tools/verilator_extract/usr/share/verilator
+
+# Project paths
+RTL_DIR = ../../Quartus/rtl/CPU
+
+# Verilator flags
+VFLAGS = --cc --exe --build -Wall
+VFLAGS += -Wno-fatal
+VFLAGS += -I$(RTL_DIR)
+VFLAGS += --trace
+VFLAGS += -CFLAGS "-std=c++14"
+VFLAGS += --top-module RegisterFile
+
+# RTL source files
+RTL_SOURCES = $(RTL_DIR)/RegisterEnum.sv $(RTL_DIR)/RegisterFile.sv
+
+# Testbench
+TB_SOURCE = registerfile_tb.cpp
+
+# Target
+TARGET = VRegisterFile
+
+.PHONY: all clean run
+
+all: $(TARGET)
+
+$(TARGET): $(RTL_SOURCES) $(TB_SOURCE)
+	VERILATOR_ROOT=$(VERILATOR_ROOT) $(VERILATOR) $(VFLAGS) $(RTL_SOURCES) $(TB_SOURCE)
+
+run: $(TARGET)
+	./obj_dir/$(TARGET)
+
+clean:
+	rm -rf obj_dir
+	rm -f registerfile_tb.vcd

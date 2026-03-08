@@ -1,0 +1,1570 @@
+//
+// TV80 8-Bit Microprocessor Core
+// Based on the VHDL T80 core by Daniel Wallner (jesus@opencores.org)
+//
+// Copyright (c) 2004 Guy Hutchison (ghutchis@opencores.org)
+//
+// Permission is hereby granted, free of charge, to any person obtaining a 
+// copy of this software and associated documentation files (the "Software"), 
+// to deal in the Software without restriction, including without limitation 
+// the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+// and/or sell copies of the Software, and to permit persons to whom the 
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included 
+// in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, 
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF 
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. 
+// IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY 
+// CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, 
+// TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE 
+// SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+`define TV80DELAY
+
+module tv80_core (/*AUTOARG*/
+  // Outputs
+  m1_n, iorq, no_read, write, rfsh_n, halt_n, busak_n, A, dout, dout_next, mc,
+  ts, intcycle_n, IntE, stop,
+  // Inputs
+  reset_n, clk, cen, wait_n, int_n, nmi_n, busrq_n, dinst, di
+  );
+  // Beginning of automatic inputs (from unused autoinst inputs)
+  // End of automatics
+  
+  parameter Mode = 1;   // 0 => Z80, 1 => Fast Z80, 2 => 8080, 3 => GB
+  parameter IOWait = 1; // 0 => Single cycle I/O, 1 => Std I/O cycle
+  parameter Flag_C = 0;
+  parameter Flag_N = 1;
+  parameter Flag_P = 2;
+  parameter Flag_X = 3;
+  parameter Flag_H = 4;
+  parameter Flag_Y = 5;
+  parameter Flag_Z = 6;
+  parameter Flag_S = 7;
+
+  input     reset_n;            
+  input     clk;                
+  input     cen;                
+  input     wait_n;             
+  input     int_n;              
+  input     nmi_n;              
+  input     busrq_n;            
+  output    m1_n;               
+  output    iorq;               
+  output    no_read;            
+  output    write;              
+  output    rfsh_n;             
+  output    halt_n;             
+  output    busak_n;            
+  output [15:0] A; 
+  input [7:0]   dinst;  
+  input [7:0]   di;     
+  output [7:0]  dout;
+  output [7:0]  dout_next;  // Combinational data output for write cycles
+  output [6:0]  mc;     
+  output [6:0]  ts;     
+  output        intcycle_n;     
+  output        IntE;           
+  output        stop;           
+
+  reg    m1_n;          
+  reg    iorq; 
+`ifdef TV80_REFRESH         
+  reg    rfsh_n;   
+`endif             
+  reg    halt_n;                
+  reg    busak_n;               
+  reg [15:0] A; 
+  reg [7:0]  dout;        
+  reg [6:0]  mc;        
+  reg [6:0]  ts;        
+  reg   intcycle_n;     
+  reg   IntE;           
+  reg   stop;           
+
+  parameter     aNone    = 3'b111;
+  parameter     aBC      = 3'b000;
+  parameter     aDE      = 3'b001;
+  parameter     aXY      = 3'b010;
+  parameter     aIOA     = 3'b100;
+  parameter     aSP      = 3'b101;
+  parameter     aZI      = 3'b110;
+
+  // Registers
+  reg [7:0]     ACC /*verilator public*/, F /*verilator public*/;
+  reg [7:0]     Ap, Fp;
+  reg [7:0]     I;
+`ifdef TV80_REFRESH
+  reg [7:0]     R;
+`endif
+  reg [15:0]    SP /*verilator public*/, PC /*verilator public*/;
+  reg [7:0]     RegDIH;
+  reg [7:0]     RegDIL;
+  wire [15:0]   RegBusA;
+  wire [15:0]   RegBusB;
+  wire [15:0]   RegBusC;
+  reg [2:0]     RegAddrA_r;
+  reg [2:0]     RegAddrA;
+  reg [2:0]     RegAddrB_r;
+  reg [2:0]     RegAddrB;
+  reg [2:0]     RegAddrC;
+  reg           RegWEH;
+  reg           RegWEL;
+  reg           Alternate;
+
+  // Help Registers
+  reg [15:0]    TmpAddr /*verilator public*/;        // Temporary address register
+  reg [7:0]     IR /*verilator public*/;             // Instruction register
+  reg [1:0]     ISet;           // Instruction set selector
+  reg [15:0]    RegBusA_r;
+
+  reg [15:0]    ID16;
+  reg [7:0]     Save_Mux;
+
+  reg [6:0]     tstate;
+  reg [6:0]     mcycle;
+  reg           last_mcycle, last_tstate;
+  reg           IntE_FF1;
+  reg           IntE_FF2;
+  reg           EI_Delay;  // GameBoy EI one-instruction delay
+  reg           Halt_FF;
+  reg           BusReq_s;
+  reg           BusAck;
+  reg           ClkEn /*verilator public*/;
+  reg           NMI_s;
+  reg           INT_s;
+  reg [1:0]     IStatus;
+
+  reg [7:0]     DI_Reg;
+  reg           T_Res;
+  reg [1:0]     XY_State;
+  reg [2:0]     Pre_XY_F_M;
+  reg           NextIs_XY_Fetch;
+  reg           XY_Ind;
+  reg           No_BTR;
+  reg           BTR_r;
+  reg           Auto_Wait;
+  reg           Auto_Wait_t1;
+  reg           Auto_Wait_t2;
+  reg           IncDecZ;
+
+  // ALU signals
+  reg [7:0]     BusB;
+  reg [7:0]     BusA;
+  wire [7:0]    ALU_Q;
+  wire [7:0]    F_Out;
+  reg [7:0]     F_Out_r;  // Registered F_Out to prevent register-read feedback hazard
+  reg [7:0]     ALU_Q_r;  // Registered ALU_Q to prevent corruption by next instruction
+
+  // Registered micro code outputs
+  reg [4:0]     Read_To_Reg_r;
+  reg           Arith16_r;
+  reg           Z16_r;
+  reg [3:0]     ALU_Op_r;
+  reg           Save_ALU_r;
+  reg           PreserveC_r;
+  reg [2:0]     mcycles;
+
+  // Micro code outputs
+  wire [2:0]    mcycles_d;
+  wire [2:0]    tstates;
+  reg           IntCycle;
+  reg           NMICycle;
+  wire          Inc_PC;
+  wire          Inc_WZ;
+  wire [3:0]    IncDec_16;
+  wire [1:0]    Prefix;
+  wire          Read_To_Acc;
+  wire          Read_To_Reg;
+  wire [3:0]     Set_BusB_To;
+  wire [3:0]     Set_BusA_To;
+  wire [3:0]     ALU_Op;
+  wire           Save_ALU;
+  wire           PreserveC;
+  wire           Arith16;
+  wire [2:0]     Set_Addr_To;
+  wire           Jump;
+  wire           JumpE;
+  wire           JumpXY;
+  wire           Call;
+  wire           RstP;
+  wire           LDZ;
+  wire           LDW;
+  wire           LDSPHL;
+  wire           iorq_i;
+  wire [2:0]     Special_LD;
+  wire           ExchangeDH;
+  wire           ExchangeRp;
+  wire           ExchangeAF;
+  wire           ExchangeRS;
+  wire           I_DJNZ;
+  wire           I_CPL;
+  wire           I_CCF;
+  wire           I_SCF;
+  wire           I_RETN;
+  wire           I_BT;
+  wire           I_BC;
+  wire           I_BTR;
+  wire           I_RLD;
+  wire           I_RRD;
+  wire           I_INRC;
+  wire           SetDI;
+  wire           SetEI;
+  wire [1:0]     IMode;
+  wire           Halt;
+
+  reg [15:0]     PC16;
+  reg [15:0]     PC16_B;
+  reg [15:0]     SP16, SP16_A, SP16_B;
+  reg [15:0]     ID16_B;
+  reg            Oldnmi_n;
+  
+  tv80_mcode #(Mode, Flag_C, Flag_N, Flag_P, Flag_X, Flag_H, Flag_Y, Flag_Z, Flag_S) i_mcode
+    (
+     .IR                   (IR),
+     .ISet                 (ISet),
+     .MCycle               (mcycle),
+     .F                    (F),
+     .NMICycle             (NMICycle),
+     .IntCycle             (IntCycle),
+     .MCycles              (mcycles_d),
+     .TStates              (tstates),
+     .Prefix               (Prefix),
+     .Inc_PC               (Inc_PC),
+     .Inc_WZ               (Inc_WZ),
+     .IncDec_16            (IncDec_16),
+     .Read_To_Acc          (Read_To_Acc),
+     .Read_To_Reg          (Read_To_Reg),
+     .Set_BusB_To          (Set_BusB_To),
+     .Set_BusA_To          (Set_BusA_To),
+     .ALU_Op               (ALU_Op),
+     .Save_ALU             (Save_ALU),
+     .PreserveC            (PreserveC),
+     .Arith16              (Arith16),
+     .Set_Addr_To          (Set_Addr_To),
+     .IORQ                 (iorq_i),
+     .Jump                 (Jump),
+     .JumpE                (JumpE),
+     .JumpXY               (JumpXY),
+     .Call                 (Call),
+     .RstP                 (RstP),
+     .LDZ                  (LDZ),
+     .LDW                  (LDW),
+     .LDSPHL               (LDSPHL),
+     .Special_LD           (Special_LD),
+     .ExchangeDH           (ExchangeDH),
+     .ExchangeRp           (ExchangeRp),
+     .ExchangeAF           (ExchangeAF),
+     .ExchangeRS           (ExchangeRS),
+     .I_DJNZ               (I_DJNZ),
+     .I_CPL                (I_CPL),
+     .I_CCF                (I_CCF),
+     .I_SCF                (I_SCF),
+     .I_RETN               (I_RETN),
+     .I_BT                 (I_BT),
+     .I_BC                 (I_BC),
+     .I_BTR                (I_BTR),
+     .I_RLD                (I_RLD),
+     .I_RRD                (I_RRD),
+     .I_INRC               (I_INRC),
+     .SetDI                (SetDI),
+     .SetEI                (SetEI),
+     .IMode                (IMode),
+     .Halt                 (Halt),
+     .NoRead               (no_read),
+     .Write                (write)
+     );
+
+  // Use combinational ALU_Op instead of registered ALU_Op_r to ensure
+  // F_Out has correct flags at T_Res when F_Out_r is captured.
+  // ALU_Op_r is updated at T_Res, so using it would cause F_Out to be
+  // computed with the OLD operation code.
+  tv80_alu #(Mode, Flag_C, Flag_N, Flag_P, Flag_X, Flag_H, Flag_Y, Flag_Z, Flag_S) i_alu
+    (
+     .Arith16              (Arith16_r),
+     .Z16                  (Z16_r),
+     .ALU_Op               (ALU_Op),
+     .IR                   (IR[5:0]),
+     .ISet                 (ISet),
+     .BusA                 (BusA),
+     .BusB                 (BusB),
+     .F_In                 (F),
+     .Q                    (ALU_Q),
+     .F_Out                (F_Out)
+     );
+
+  function [6:0] number_to_bitvec;
+    input [2:0] num;
+    begin
+      case (num)
+        1 : number_to_bitvec = 7'b0000001;
+        2 : number_to_bitvec = 7'b0000010;
+        3 : number_to_bitvec = 7'b0000100;
+        4 : number_to_bitvec = 7'b0001000;
+        5 : number_to_bitvec = 7'b0010000;
+        6 : number_to_bitvec = 7'b0100000;
+        7 : number_to_bitvec = 7'b1000000;
+        default : number_to_bitvec = 7'bx;
+      endcase // case(num)
+    end
+  endfunction // number_to_bitvec
+
+  function [2:0] mcyc_to_number;
+    input [6:0] mcyc;
+    begin
+      casez (mcyc)
+        7'b1zzzzzz : mcyc_to_number = 3'h7;
+        7'b01zzzzz : mcyc_to_number = 3'h6;
+        7'b001zzzz : mcyc_to_number = 3'h5;
+        7'b0001zzz : mcyc_to_number = 3'h4;
+        7'b00001zz : mcyc_to_number = 3'h3;
+        7'b000001z : mcyc_to_number = 3'h2;
+        7'b0000001 : mcyc_to_number = 3'h1;
+        default : mcyc_to_number = 3'h1;
+      endcase
+    end
+  endfunction
+  
+  always @(/*AUTOSENSE*/mcycle or mcycles or tstate or tstates)
+    begin
+      case (mcycles)
+        1 : last_mcycle = mcycle[0];
+        2 : last_mcycle = mcycle[1];
+        3 : last_mcycle = mcycle[2];
+        4 : last_mcycle = mcycle[3];
+        5 : last_mcycle = mcycle[4];
+        6 : last_mcycle = mcycle[5];
+        7 : last_mcycle = mcycle[6];
+        default : last_mcycle = 1'bx;
+      endcase // case(mcycles)
+
+      case (tstates)
+        0 : last_tstate = tstate[0];
+        1 : last_tstate = tstate[1];
+        2 : last_tstate = tstate[2];
+        3 : last_tstate = tstate[3];
+        4 : last_tstate = tstate[4];
+        5 : last_tstate = tstate[5];
+        6 : last_tstate = tstate[6];
+        default : last_tstate = 1'bx;
+      endcase
+    end // always @ (...
+  
+          
+  // MODIFICATION: Use cen directly with BusAck check inline to avoid scheduling issues
+  // ClkEn is now just a wire alias
+  wire ClkEn_wire = cen && ~ BusAck;
+
+  // Keep ClkEn as reg for compatibility, but update it synchronously
+  always @(posedge clk or negedge reset_n)
+    begin
+      if (reset_n == 1'b0)
+        ClkEn <= `TV80DELAY 1'b0;
+      else
+        ClkEn <= `TV80DELAY ClkEn_wire;
+    end
+
+  always @(/*AUTOSENSE*/ALU_Q or BusB or DI_Reg
+	   or ExchangeRp or IR or Save_ALU_r or Set_Addr_To or XY_Ind
+	   or XY_State or last_tstate or mcycle)
+    begin
+      if (last_tstate)
+        T_Res = 1'b1;
+      else T_Res = 1'b0;
+
+      if (XY_State != 2'b00 && XY_Ind == 1'b0 &&
+          ((Set_Addr_To == aXY) ||
+           (mcycle[0] && IR == 8'b11001011) ||
+           (mcycle[0] && IR == 8'b00110110)))
+        NextIs_XY_Fetch = 1'b1;
+      else
+        NextIs_XY_Fetch = 1'b0;
+
+      if (ExchangeRp)
+        Save_Mux = BusB;
+      else if (!Save_ALU_r)
+        Save_Mux = DI_Reg;
+      else
+        Save_Mux = ALU_Q_r;  // Use registered ALU result to avoid corruption by next instruction
+    end // always @ *
+  
+  always @ (posedge clk or negedge reset_n)
+    begin
+      if (reset_n == 1'b0 ) 
+        begin
+          PC <= `TV80DELAY 0;  // Program Counter
+          A <= `TV80DELAY 0;
+          TmpAddr <= `TV80DELAY 0;
+          IR <= `TV80DELAY 8'b00000000;
+          ISet <= `TV80DELAY 2'b00;
+          XY_State <= `TV80DELAY 2'b00;
+          IStatus <= `TV80DELAY 2'b00;
+          mcycles <= `TV80DELAY 3'b000;
+          dout <= `TV80DELAY 8'b00000000;
+
+`ifdef GAMEBOY_SIM
+          // Many open/fast boot ROMs assume A/flags start at 0 on reset and
+          // don't explicitly clear them before initializing VRAM/IO.
+          ACC <= `TV80DELAY 8'h00;
+          F <= `TV80DELAY 8'h00;
+          Ap <= `TV80DELAY 8'h00;
+          Fp <= `TV80DELAY 8'h00;
+`else
+          ACC <= `TV80DELAY 8'hFF;
+          F <= `TV80DELAY 8'hFF;
+          Ap <= `TV80DELAY 8'hFF;
+          Fp <= `TV80DELAY 8'hFF;
+`endif
+          I <= `TV80DELAY 0;
+          `ifdef TV80_REFRESH
+          R <= `TV80DELAY 0;
+          `endif
+`ifdef GAMEBOY_SIM
+          SP <= `TV80DELAY 16'hFFFE;
+`else
+          SP <= `TV80DELAY 16'hFFFF;
+`endif
+          Alternate <= `TV80DELAY 1'b0;
+
+          Read_To_Reg_r <= `TV80DELAY 5'b00000;
+          Arith16_r <= `TV80DELAY 1'b0;
+          BTR_r <= `TV80DELAY 1'b0;
+          Z16_r <= `TV80DELAY 1'b0;
+          ALU_Op_r <= `TV80DELAY 4'b0000;
+          Save_ALU_r <= `TV80DELAY 1'b0;
+          PreserveC_r <= `TV80DELAY 1'b0;
+          XY_Ind <= `TV80DELAY 1'b0;
+          F_Out_r <= `TV80DELAY 8'h00;
+        end 
+      else 
+        begin
+
+          if (ClkEn_wire == 1'b1 ) 
+            begin
+
+              ALU_Op_r <= `TV80DELAY 4'b0000;
+              Save_ALU_r <= `TV80DELAY 1'b0;
+              Read_To_Reg_r <= `TV80DELAY 5'b00000;
+
+              mcycles <= `TV80DELAY mcycles_d;
+
+              if (IMode != 2'b11 ) 
+                begin
+                  IStatus <= `TV80DELAY IMode;
+                end
+
+              Arith16_r <= `TV80DELAY Arith16;
+              PreserveC_r <= `TV80DELAY PreserveC;
+              if (ISet == 2'b10 && ALU_Op[2] == 1'b0 && ALU_Op[0] == 1'b1 && mcycle[2] ) 
+                begin
+                  Z16_r <= `TV80DELAY 1'b1;
+                end 
+              else 
+                begin
+                  Z16_r <= `TV80DELAY 1'b0;
+                end
+
+              if (mcycle[0] && (tstate[1] | tstate[2] | tstate[3] )) 
+                begin
+                  // mcycle == 1 && tstate == 1, 2, || 3
+                  if (tstate[2] && wait_n == 1'b1 ) 
+                    begin
+                      `ifdef TV80_REFRESH
+                      if (Mode < 2 ) 
+                        begin
+                          A[7:0] <= `TV80DELAY R;
+                          A[15:8] <= `TV80DELAY I;
+                          R[6:0] <= `TV80DELAY R[6:0] + 1;
+                        end
+                      `endif
+                      // PC must advance after the opcode fetch for multi-byte instructions.
+                      // For CALL (and similar flow-control ops), the microcode relies on the
+                      // standard M1 increment to move PC to the immediate operand bytes.
+                      // Gating this increment on `Call==0` causes CALL to push an incorrect
+                      // return address (observed as $4080 for CALL at $0040 in the DMG boot ROM),
+                      // which then makes RET jump to garbage and breaks the boot flow.
+                      if (Jump == 1'b0 && NMICycle == 1'b0 && IntCycle == 1'b0 && ~ (Halt_FF == 1'b1 || Halt == 1'b1) ) 
+                        begin
+                          PC <= `TV80DELAY PC16;
+                        end
+
+                      if (IntCycle == 1'b1 && IStatus == 2'b01 ) 
+                        begin
+                          IR <= `TV80DELAY 8'b11111111;
+                        end 
+                      // GameBoy mode (Mode==3): fetch interrupt vector from data bus
+                      // Z80 mode 2: same behavior, but upper address uses I register
+                      else if (Halt_FF == 1'b1 || (IntCycle == 1'b1 && IStatus == 2'b10) || NMICycle == 1'b1 ||
+                               (IntCycle == 1'b1 && Mode == 3))
+                        begin
+                          IR <= `TV80DELAY 8'b00000000;
+			  TmpAddr[7:0] <= `TV80DELAY dinst; // Special M1 vector fetch
+                        end 
+                      else 
+                        begin
+                          IR <= `TV80DELAY dinst;
+                        end
+
+                      ISet <= `TV80DELAY 2'b00;
+                      if (Prefix != 2'b00 ) 
+                        begin
+                          if (Prefix == 2'b11 ) 
+                            begin
+                              if (IR[5] == 1'b1 ) 
+                                begin
+                                  XY_State <= `TV80DELAY 2'b10;
+                                end 
+                              else 
+                                begin
+                                  XY_State <= `TV80DELAY 2'b01;
+                                end
+                            end 
+                          else 
+                            begin
+                              if (Prefix == 2'b10 ) 
+                                begin
+                                  XY_State <= `TV80DELAY 2'b00;
+                                  XY_Ind <= `TV80DELAY 1'b0;
+                                end
+                              ISet <= `TV80DELAY Prefix;
+                            end
+                        end 
+                      else 
+                        begin
+                          XY_State <= `TV80DELAY 2'b00;
+                          XY_Ind <= `TV80DELAY 1'b0;
+                        end
+                    end // if (tstate == 2 && wait_n == 1'b1 )
+                  
+
+                end 
+              else 
+                begin
+                  // either (mcycle > 1) OR (mcycle == 1 AND tstate > 3)
+
+                  if (mcycle[5] ) 
+                    begin
+                      XY_Ind <= `TV80DELAY 1'b1;
+                      if (Prefix == 2'b01 ) 
+                        begin
+                          ISet <= `TV80DELAY 2'b01;
+                        end
+                    end
+                  
+                  if (T_Res == 1'b1 ) 
+                    begin
+                      BTR_r <= `TV80DELAY (I_BT || I_BC || I_BTR) && ~ No_BTR;
+                      // Z80 Jump: for mode 2 IntCycle, use DI_Reg:TmpAddr as jump target
+                      // Exclude GameBoy mode (Mode==3) IntCycle - handled separately below
+                      if (Jump == 1'b1 && !(IntCycle == 1'b1 && Mode == 3))
+                        begin
+                          A[15:8] <= `TV80DELAY DI_Reg;
+                          A[7:0] <= `TV80DELAY TmpAddr[7:0];
+                          PC[15:8] <= `TV80DELAY DI_Reg;
+                          PC[7:0] <= `TV80DELAY TmpAddr[7:0];
+                        end 
+                      else if (JumpXY == 1'b1 ) 
+                        begin
+                          A <= `TV80DELAY RegBusC;
+                          PC <= `TV80DELAY RegBusC;
+                        end else if (Call == 1'b1 || RstP == 1'b1 ) 
+                          begin
+                            A <= `TV80DELAY TmpAddr;
+                            PC <= `TV80DELAY TmpAddr;
+                          end 
+                        else if (last_mcycle && NMICycle == 1'b1 )
+                          begin
+                            A <= `TV80DELAY 16'b0000000001100110;
+                            PC <= `TV80DELAY 16'b0000000001100110;
+                          end
+                        // GameBoy mode (Mode==3): jump to interrupt vector at M5
+                        // Vector (0x40/0x48/0x50/0x58/0x60) is in TmpAddr[7:0], jump to 0x00XX
+                        else if (mcycle[4] && IntCycle == 1'b1 && Mode == 3)
+                          begin
+                            A[15:8] <= `TV80DELAY 8'h00;
+                            A[7:0] <= `TV80DELAY TmpAddr[7:0];
+                            PC[15:8] <= `TV80DELAY 8'h00;
+                            PC[7:0] <= `TV80DELAY TmpAddr[7:0];
+                          end
+                        // Z80 mode 2: jump to (I * 256 + vector) - handled by Jump condition above
+                        else if (mcycle[4] && IntCycle == 1'b1 && IStatus == 2'b10)
+                          begin
+                            A[15:8] <= `TV80DELAY I;
+                            A[7:0] <= `TV80DELAY TmpAddr[7:0];
+                            PC[15:8] <= `TV80DELAY I;
+                            PC[7:0] <= `TV80DELAY TmpAddr[7:0];
+                          end 
+                        else 
+                          begin
+                            // At the instruction boundary (end of the last MCycle),
+                            // make sure the external address bus returns to PC for the
+                            // next opcode fetch. Without this, stack operations like
+                            // PUSH can leave `A` pointing at SP for one M1 cycle,
+                            // causing the core to fetch the next opcode from the stack
+                            // (observed in DMG boot ROM at $00BC: F5; next opcode fetch
+                            // incorrectly reads from $FFFA instead of $00BD).
+                            if (last_mcycle) begin
+                              A <= `TV80DELAY PC;
+                            end else begin
+                              case (Set_Addr_To)
+                              aXY :
+                                begin
+                                  if (XY_State == 2'b00 ) 
+                                    begin
+                                      A <= `TV80DELAY RegBusC;
+                                    end 
+                                  else 
+                                    begin
+                                      if (NextIs_XY_Fetch == 1'b1 )
+                                        begin
+                                          A <= `TV80DELAY PC;
+                                        end 
+                                      else 
+                                        begin
+                                          A <= `TV80DELAY TmpAddr;
+                                        end
+                                    end // else: !if(XY_State == 2'b00 )
+                                end // case: aXY
+                              
+                              aIOA :
+                                begin
+                                  if (Mode == 3 ) 
+                                    begin
+                                      // Memory map I/O on GBZ80
+                                      A[15:8] <= `TV80DELAY 8'hFF;
+                                    end 
+                                  else if (Mode == 2 ) 
+                                    begin
+                                      // Duplicate I/O address on 8080
+                                      A[15:8] <= `TV80DELAY DI_Reg;
+                                    end 
+                                  else 
+                                    begin
+                                      A[15:8] <= `TV80DELAY ACC;
+                                    end
+                                  A[7:0] <= `TV80DELAY DI_Reg;
+                                end // case: aIOA
+
+                              
+                              aSP :
+                                begin
+                                  A <= `TV80DELAY SP;
+                                end
+                              
+                              aBC :
+                                begin
+                                  if (Mode == 3 && iorq_i == 1'b1 ) 
+                                    begin
+                                      // Memory map I/O on GBZ80
+                                      A[15:8] <= `TV80DELAY 8'hFF;
+                                      A[7:0] <= `TV80DELAY RegBusC[7:0];
+                                    end 
+                                  else 
+                                    begin
+                                      A <= `TV80DELAY RegBusC;
+                                    end
+                                end // case: aBC
+                              
+                              aDE :
+                                begin
+                                  A <= `TV80DELAY RegBusC;
+                                end
+                              
+                              aZI :
+                                begin                                  
+                                  if (Inc_WZ == 1'b1 ) 
+                                    begin
+                                      A <= `TV80DELAY TmpAddr + 1;
+                                    end 
+                                  else 
+                                    begin
+                                      A[15:8] <= `TV80DELAY DI_Reg;
+                                      A[7:0] <= `TV80DELAY TmpAddr[7:0];
+                                    end
+                                end // case: aZI
+                              
+                              default   :
+                                begin                                    
+                                  A <= `TV80DELAY PC;
+                                end
+                              endcase // case(Set_Addr_To)
+                            end
+                            
+                          end // else: !if(mcycle[2] && IntCycle == 1'b1 && IStatus == 2'b10 )
+                      
+
+                      Save_ALU_r <= `TV80DELAY Save_ALU;
+                      ALU_Op_r <= `TV80DELAY ALU_Op;
+                      // Capture F_Out at T_Res to prevent register-read feedback hazard
+                      // This captures the correct ALU flags before BusA is corrupted by
+                      // the register file write-back (INC r would otherwise compute
+                      // half-carry incorrectly due to BusA picking up the new value)
+                      if (Save_ALU == 1'b1) begin
+                        F_Out_r <= `TV80DELAY F_Out;
+                        ALU_Q_r <= `TV80DELAY ALU_Q;  // Capture ALU result before next instruction corrupts it
+                      end
+                      
+                      if (I_CPL == 1'b1 )
+                        begin
+                          // CPL - Complement A, set N=1, H=1
+                          ACC <= `TV80DELAY ~ ACC;
+                          if (Mode == 3) begin
+                            // GameBoy format: N at bit 6, H at bit 5
+                            F[6] <= `TV80DELAY 1'b1;  // N flag
+                            F[5] <= `TV80DELAY 1'b1;  // H flag
+                          end else begin
+                            F[Flag_Y] <= `TV80DELAY ~ ACC[5];
+                            F[Flag_H] <= `TV80DELAY 1'b1;
+                            F[Flag_X] <= `TV80DELAY ~ ACC[3];
+                            F[Flag_N] <= `TV80DELAY 1'b1;
+                          end
+                        end
+                      if (I_CCF == 1'b1 )
+                        begin
+                          // CCF - Complement Carry, set N=0, H=previous C
+                          if (Mode == 3) begin
+                            // GameBoy format: C at bit 4, N at bit 6, H at bit 5
+                            F[4] <= `TV80DELAY ~ F[4];  // Complement C
+                            F[6] <= `TV80DELAY 1'b0;    // N = 0
+                            F[5] <= `TV80DELAY F[4];    // H = previous C
+                          end else begin
+                            F[Flag_C] <= `TV80DELAY ~ F[Flag_C];
+                            F[Flag_Y] <= `TV80DELAY ACC[5];
+                            F[Flag_H] <= `TV80DELAY F[Flag_C];
+                            F[Flag_X] <= `TV80DELAY ACC[3];
+                            F[Flag_N] <= `TV80DELAY 1'b0;
+                          end
+                        end
+                      if (I_SCF == 1'b1 )
+                        begin
+                          // SCF - Set Carry, set N=0, H=0
+                          if (Mode == 3) begin
+                            // GameBoy format: C at bit 4, N at bit 6, H at bit 5
+                            F[4] <= `TV80DELAY 1'b1;   // C = 1
+                            F[6] <= `TV80DELAY 1'b0;   // N = 0
+                            F[5] <= `TV80DELAY 1'b0;   // H = 0
+                          end else begin
+                            F[Flag_C] <= `TV80DELAY 1'b1;
+                            F[Flag_Y] <= `TV80DELAY ACC[5];
+                            F[Flag_H] <= `TV80DELAY 1'b0;
+                            F[Flag_X] <= `TV80DELAY ACC[3];
+                            F[Flag_N] <= `TV80DELAY 1'b0;
+                          end
+                        end
+                    end // if (T_Res == 1'b1 )
+                  
+
+                  if (tstate[2])
+                    begin
+                      if (wait_n == 1'b1 ) 
+                        begin
+                          if (ISet == 2'b01 && mcycle[6] ) 
+                            begin
+                              IR <= `TV80DELAY dinst;
+                            end
+                          if (JumpE == 1'b1 ) 
+                            begin
+                              PC <= `TV80DELAY PC16;
+                            end 
+                          else if (Inc_PC == 1'b1 ) 
+                            begin
+                              //PC <= `TV80DELAY PC + 1;
+                              PC <= `TV80DELAY PC16;
+                            end
+                          if (BTR_r == 1'b1 ) 
+                            begin
+                              //PC <= `TV80DELAY PC - 2;
+                              PC <= `TV80DELAY PC16;
+                            end
+                        end
+                      if (RstP == 1'b1 ) 
+                        begin
+                          TmpAddr <= `TV80DELAY { 10'h0, IR[5:3], 3'h0 };
+                          //TmpAddr <= `TV80DELAY (others =>1'b0);
+                          //TmpAddr[5:3] <= `TV80DELAY IR[5:3];
+                        end
+                    end
+                  if (tstate[3] && mcycle[5] ) 
+                    begin
+                      TmpAddr <= `TV80DELAY SP16;
+                    end
+
+                  if ((tstate[2] && wait_n == 1'b1) || (tstate[4] && mcycle[0]) ) 
+                    begin
+                      if (IncDec_16[2:0] == 3'b111 ) 
+                        begin
+                          SP <= `TV80DELAY SP16;
+                        end
+                    end
+
+                  if (LDSPHL == 1'b1 ) 
+                    begin
+                      SP <= `TV80DELAY RegBusC;
+                    end
+                  if (ExchangeAF == 1'b1 )
+                    begin
+                      Ap <= `TV80DELAY ACC;
+                      ACC <= `TV80DELAY Ap;
+                      Fp <= `TV80DELAY F;
+                      // In GameBoy mode (Mode==3), F[3:0] must always be 0
+                      if (Mode == 3)
+                        F <= `TV80DELAY {Fp[7:4], 4'b0000};
+                      else
+                        F <= `TV80DELAY Fp;
+                    end
+                  if (ExchangeRS == 1'b1 ) 
+                    begin
+                      Alternate <= `TV80DELAY ~ Alternate;
+                    end
+                end // else: !if(mcycle  == 3'b001 && tstate(2) == 1'b0 )
+              
+
+              if (tstate[3] ) 
+                begin
+                  if (LDZ == 1'b1 ) 
+                    begin
+                      TmpAddr[7:0] <= `TV80DELAY DI_Reg;
+                    end
+                  if (LDW == 1'b1 ) 
+                    begin
+                      TmpAddr[15:8] <= `TV80DELAY DI_Reg;
+                    end
+
+                  if (Special_LD[2] == 1'b1 ) 
+                    begin
+                      case (Special_LD[1:0])
+                        2'b00 :
+                          begin
+                            ACC <= `TV80DELAY I;
+                            F[Flag_P] <= `TV80DELAY IntE_FF2;
+			    F[Flag_Z] <= (I == 0);
+			    F[Flag_S] <= I[7];
+			    F[Flag_H] <= 0;
+			    F[Flag_N] <= 0; 
+                          end
+                        
+                        2'b01 :
+                          begin
+                            `ifdef TV80_REFRESH
+                            ACC <= `TV80DELAY R;
+                            `else
+                            ACC <= `TV80DELAY 0;
+                            `endif
+                            F[Flag_P] <= `TV80DELAY IntE_FF2;
+			    F[Flag_Z] <= (I == 0);
+			    F[Flag_S] <= I[7];
+			    F[Flag_H] <= 0;
+			    F[Flag_N] <= 0; 
+                          end
+                        
+                        2'b10 :
+                          I <= `TV80DELAY ACC;
+
+                        `ifdef TV80_REFRESH                        
+                        default :
+                          R <= `TV80DELAY ACC;
+                        `else
+                        default : ;
+                        `endif                        
+                      endcase
+                    end
+                end // if (tstate == 3 )
+              
+
+              if ((I_DJNZ == 1'b0 && Save_ALU_r == 1'b1) || ALU_Op_r == 4'b1001 )
+                begin
+                  if (Mode == 3 )
+                    begin
+                      // Use F_Out_r (registered version) to avoid register-read feedback hazard
+                      // F_Out_r was captured at T_Res before BusA was corrupted by register write-back
+                      // IMPORTANT: Remap ALU flag positions to GameBoy flag positions:
+                      //   ALU format: Flag_C=0, Flag_N=1, Flag_H=4, Flag_Z=6
+                      //   GameBoy format: Z=bit7, N=bit6, H=bit5, C=bit4, bits 3-0 always 0
+                      F[7] <= `TV80DELAY F_Out_r[Flag_Z];  // GB Z flag (bit 7) from ALU Z (bit 6)
+                      F[6] <= `TV80DELAY F_Out_r[Flag_N];  // GB N flag (bit 6) from ALU N (bit 1)
+                      F[5] <= `TV80DELAY F_Out_r[Flag_H];  // GB H flag (bit 5) from ALU H (bit 4)
+                      F[3:0] <= `TV80DELAY 4'b0000;       // GB: Lower 4 bits always 0
+                      if (PreserveC_r == 1'b0 )
+                        begin
+                          F[4] <= `TV80DELAY F_Out_r[Flag_C];  // GB C flag (bit 4) from ALU C (bit 0)
+                        end
+                    end
+                  else
+                    begin
+                      F[7:1] <= `TV80DELAY F_Out[7:1];
+                      if (PreserveC_r == 1'b0 )
+                        begin
+                          F[Flag_C] <= `TV80DELAY F_Out[0];
+                        end
+                    end
+                end // if ((I_DJNZ == 1'b0 && Save_ALU_r == 1'b1) || ALU_Op_r == 4'b1001 )
+              
+              if (T_Res == 1'b1 && I_INRC == 1'b1 ) 
+                begin
+                  F[Flag_H] <= `TV80DELAY 1'b0;
+                  F[Flag_N] <= `TV80DELAY 1'b0;
+                  if (DI_Reg[7:0] == 8'b00000000 ) 
+                    begin
+                      F[Flag_Z] <= `TV80DELAY 1'b1;
+                    end 
+                  else 
+                    begin
+                      F[Flag_Z] <= `TV80DELAY 1'b0;
+                    end
+                  F[Flag_S] <= `TV80DELAY DI_Reg[7];
+                  F[Flag_P] <= `TV80DELAY ~ (^DI_Reg[7:0]);
+                end // if (T_Res == 1'b1 && I_INRC == 1'b1 )
+              
+
+              // Update dout during both T2 and T3. Some write sequences (notably
+              // PUSH/POP around the DMG boot ROM logo routine) can change the
+              // bus selection late enough that sampling only in T2 leaves dout
+              // stuck at a stale value for the write cycle.
+              if ((tstate[1] || tstate[2]) && Auto_Wait_t1 == 1'b0 ) 
+                begin
+                  dout <= `TV80DELAY BusB_next;
+                  if (I_RLD == 1'b1 ) 
+                    begin
+                      dout[3:0] <= `TV80DELAY BusA_next[3:0];
+                      dout[7:4] <= `TV80DELAY BusB_next[3:0];
+                    end
+                  if (I_RRD == 1'b1 ) 
+                    begin
+                      dout[3:0] <= `TV80DELAY BusB_next[7:4];
+                      dout[7:4] <= `TV80DELAY BusA_next[3:0];
+                    end
+                end
+
+              if (T_Res == 1'b1 ) 
+                begin
+                  Read_To_Reg_r[3:0] <= `TV80DELAY Set_BusA_To;
+                  Read_To_Reg_r[4] <= `TV80DELAY Read_To_Reg;
+                  if (Read_To_Acc == 1'b1 ) 
+                    begin
+                      Read_To_Reg_r[3:0] <= `TV80DELAY 4'b0111;
+                      Read_To_Reg_r[4] <= `TV80DELAY 1'b1;
+                    end
+                end
+
+              if (tstate[1] && I_BT == 1'b1 ) 
+                begin
+                  F[Flag_X] <= `TV80DELAY ALU_Q[3];
+                  F[Flag_Y] <= `TV80DELAY ALU_Q[1];
+                  F[Flag_H] <= `TV80DELAY 1'b0;
+                  F[Flag_N] <= `TV80DELAY 1'b0;
+                end
+              if (I_BC == 1'b1 || I_BT == 1'b1 ) 
+                begin
+                  F[Flag_P] <= `TV80DELAY IncDecZ;
+                end
+
+              if ((tstate[1] && Save_ALU_r == 1'b0 && Auto_Wait_t1 == 1'b0) ||
+                  (Save_ALU_r == 1'b1 && ALU_Op_r != 4'b0111) ) 
+                begin
+                  case (Read_To_Reg_r)
+                    5'b10111 :
+                      ACC <= `TV80DELAY Save_Mux;
+                    5'b10110 :
+                      dout <= `TV80DELAY Save_Mux;
+                    5'b11000 :
+                      SP[7:0] <= `TV80DELAY Save_Mux;
+                    5'b11001 :
+                      SP[15:8] <= `TV80DELAY Save_Mux;
+                    5'b11011 :
+                      // In GameBoy mode (Mode==3), F[3:0] must always be 0
+                      if (Mode == 3)
+                        F <= `TV80DELAY {Save_Mux[7:4], 4'b0000};
+                      else
+                        F <= `TV80DELAY Save_Mux;
+                    default : ;
+                  endcase
+                end // if ((tstate == 1 && Save_ALU_r == 1'b0 && Auto_Wait_t1 == 1'b0) ||...              
+            end // if (ClkEn == 1'b1 )         
+        end // else: !if(reset_n == 1'b0 )
+    end
+  
+
+  //-------------------------------------------------------------------------
+  //
+  // BC('), DE('), HL('), IX && IY
+  //
+  //-------------------------------------------------------------------------
+  always @ (posedge clk)
+    begin
+      if (ClkEn_wire == 1'b1 ) 
+        begin
+          // Bus A / Write
+          RegAddrA_r <= `TV80DELAY  { Alternate, Set_BusA_To[2:1] };
+          if (XY_Ind == 1'b0 && XY_State != 2'b00 && Set_BusA_To[2:1] == 2'b10 ) 
+            begin
+              RegAddrA_r <= `TV80DELAY { XY_State[1],  2'b11 };
+            end
+
+          // Bus B
+          RegAddrB_r <= `TV80DELAY { Alternate, Set_BusB_To[2:1] };
+          if (XY_Ind == 1'b0 && XY_State != 2'b00 && Set_BusB_To[2:1] == 2'b10 ) 
+            begin
+              RegAddrB_r <= `TV80DELAY { XY_State[1],  2'b11 };
+            end
+
+          // Address from register
+          RegAddrC <= `TV80DELAY { Alternate,  Set_Addr_To[1:0] };
+          // Jump (HL), LD SP,HL
+          if ((JumpXY == 1'b1 || LDSPHL == 1'b1) ) 
+            begin
+              RegAddrC <= `TV80DELAY { Alternate, 2'b10 };
+            end
+          if (((JumpXY == 1'b1 || LDSPHL == 1'b1) && XY_State != 2'b00) || (mcycle[5]) ) 
+            begin
+              RegAddrC <= `TV80DELAY { XY_State[1],  2'b11 };
+            end
+
+          if (I_DJNZ == 1'b1 && Save_ALU_r == 1'b1 && Mode < 2 ) 
+            begin
+              IncDecZ <= `TV80DELAY F_Out[Flag_Z];
+            end
+          if ((tstate[2] || (tstate[3] && mcycle[0])) && IncDec_16[2:0] == 3'b100 ) 
+            begin
+              if (ID16 == 0 ) 
+                begin
+                  IncDecZ <= `TV80DELAY 1'b0;
+                end 
+              else 
+                begin
+                  IncDecZ <= `TV80DELAY 1'b1;
+                end
+            end
+          
+          RegBusA_r <= `TV80DELAY RegBusA;
+        end
+      
+    end // always @ (posedge clk)
+  
+
+  // Detect INC r / DEC r instructions (00xxx100 and 00xxx101, xxx != 110)
+  // For T3 detection: use IR (which has new opcode after T2 edge)
+  wire inc_dec_r_ir = (IR[7:6] == 2'b00) && (IR[2:1] == 2'b10) && (IR[5:3] != 3'b110);
+
+  always @(/*AUTOSENSE*/Alternate or ExchangeDH or IncDec_16 or IR
+	   or RegAddrA_r or RegAddrB_r or Set_BusA_To or Set_BusB_To or XY_State or mcycle or tstate or inc_dec_r_ir)
+    begin
+      // Fix: Bypass RegAddrA for INC r / DEC r instructions during M1/T3.
+      // RegAddrA_r is updated with Set_BusA_To at clock edges, but due to non-blocking
+      // assignment ordering, RegAddrA_r captures the OLD Set_BusA_To value.
+      // At T3, IR has the new opcode (updated at T2 edge), so Set_BusA_To is correct.
+      // We bypass RegAddrA_r and use Set_BusA_To directly to get the correct register pair.
+      // tstate encoding: tstate[3] = T3 (value 8)
+      if (tstate[3] && mcycle[0] && inc_dec_r_ir)
+        // Use Set_BusA_To[2:1] directly for pair (IR-based, valid at T3)
+        RegAddrA = { Alternate, Set_BusA_To[2:1] };
+      else if ((tstate[2] || (tstate[3] && mcycle[0] && IncDec_16[2] == 1'b1)) && XY_State == 2'b00)
+        RegAddrA = { Alternate, IncDec_16[1:0] };
+      else if ((tstate[2] || (tstate[3] && mcycle[0] && IncDec_16[2] == 1'b1)) && IncDec_16[1:0] == 2'b10)
+        RegAddrA = { XY_State[1], 2'b11 };
+      else if (ExchangeDH == 1'b1 && tstate[3])
+        RegAddrA = { Alternate, 2'b10 };
+      else if (ExchangeDH == 1'b1 && tstate[4])
+        RegAddrA = { Alternate, 2'b01 };
+      else
+        RegAddrA = RegAddrA_r;
+      
+      if (ExchangeDH == 1'b1 && tstate[3])
+        RegAddrB = { Alternate, 2'b01 };
+      // Fix: Use direct microcode output for RegAddrB when Set_BusB_To selects a register pair.
+      // This avoids a one-cycle delay that causes PUSH to read the wrong register.
+      // Without this, RegAddrB_r is updated at clock edge, but BusB_next needs the value
+      // immediately for dout to capture the correct data at T2.
+      else if (Set_BusB_To[3] == 1'b0 && Set_BusB_To[2:0] != 3'b111 && Set_BusB_To[2:0] != 3'b110)
+        // Set_BusB_To indicates a register pair (0-5: BC/DE/HL pair bytes)
+        RegAddrB = { Alternate, Set_BusB_To[2:1] };
+      else
+        RegAddrB = RegAddrB_r;
+    end // always @ *
+  
+
+  always @(/*AUTOSENSE*/ALU_Op_r or Auto_Wait_t1 or ExchangeDH
+	   or IncDec_16 or Read_To_Reg_r or Save_ALU_r or Save_ALU or mcycle
+	   or tstate or wait_n or T_Res or Read_To_Reg or Set_BusA_To)
+    begin
+      RegWEH = 1'b0;
+      RegWEL = 1'b0;
+      if ((tstate[1] && ~Save_ALU_r && ~Auto_Wait_t1) ||
+          (Save_ALU_r && (ALU_Op_r != 4'b0111)) )
+        begin
+          case (Read_To_Reg_r)
+            5'b10000 , 5'b10001 , 5'b10010 , 5'b10011 , 5'b10100 , 5'b10101 :
+              begin
+                RegWEH = ~ Read_To_Reg_r[0];
+                RegWEL = Read_To_Reg_r[0];
+              end // UNMATCHED !!
+            default : ;
+          endcase // case(Read_To_Reg_r)
+
+        end // if ((tstate == 1 && Save_ALU_r == 1'b0 && Auto_Wait_t1 == 1'b0) ||...
+
+      // Fix: Also write register at T_Res (end of M-cycle) when Read_To_Reg is asserted.
+      // This fixes LD rr,nn instructions where the high byte write was delayed to the
+      // next instruction due to pipelining of Read_To_Reg_r.
+      // The write uses the current cycle's Set_BusA_To directly, not the registered version.
+      // IMPORTANT: Use ~Save_ALU (combinational) not ~Save_ALU_r (registered) to exclude
+      // INC/DEC r instructions which use ALU - Save_ALU_r isn't set until this edge.
+      if (T_Res && Read_To_Reg && ~Save_ALU)
+        begin
+          // Set_BusA_To encoding for register pairs: [2:1]=pair, [0]=low/high
+          // 5'b10000 = B, 5'b10001 = C, 5'b10010 = D, 5'b10011 = E, 5'b10100 = H, 5'b10101 = L
+          case ({1'b1, Set_BusA_To})
+            5'b10000 , 5'b10001 , 5'b10010 , 5'b10011 , 5'b10100 , 5'b10101 :
+              begin
+                RegWEH = ~ Set_BusA_To[0];
+                RegWEL = Set_BusA_To[0];
+              end
+            default : ;
+          endcase
+        end
+      
+
+      if (ExchangeDH && (tstate[3] || tstate[4]) ) 
+        begin
+          RegWEH = 1'b1;
+          RegWEL = 1'b1;
+        end
+
+      // Fix: Remove wait_n requirement for IncDec register writes.
+      // The increment is an internal CPU operation that doesn't depend on external memory.
+      // For GameBoy (Mode=3), wait_n is tied to SDRAM ready which is often low during TState=2,
+      // causing HL increment to be skipped in LD A,(HL+) and similar instructions.
+      if (IncDec_16[2] && ((tstate[2] && ~mcycle[0]) || (tstate[3] && mcycle[0])) )
+        begin
+          case (IncDec_16[1:0])
+            2'b00 , 2'b01 , 2'b10 :
+              begin
+                RegWEH = 1'b1;
+                RegWEL = 1'b1;
+              end // UNMATCHED !!
+            default : ;
+          endcase
+        end
+    end // always @ *
+  
+
+  always @(/*AUTOSENSE*/ExchangeDH or ID16 or IncDec_16 or RegBusA_r
+	   or RegBusB or Save_Mux or mcycle or tstate)
+    begin
+      RegDIH = Save_Mux;
+      RegDIL = Save_Mux;
+
+      if (ExchangeDH == 1'b1 && tstate[3] ) 
+        begin
+          RegDIH = RegBusB[15:8];
+          RegDIL = RegBusB[7:0];
+        end
+      else if (ExchangeDH == 1'b1 && tstate[4] ) 
+        begin
+          RegDIH = RegBusA_r[15:8];
+          RegDIL = RegBusA_r[7:0];
+        end
+      else if (IncDec_16[2] == 1'b1 && ((tstate[2] && ~mcycle[0]) || (tstate[3] && mcycle[0])) ) 
+        begin
+          RegDIH = ID16[15:8];
+          RegDIL = ID16[7:0];
+        end
+    end
+
+  tv80_reg i_reg
+    (
+     .clk                  (clk),
+     .CEN                  (ClkEn),
+     .WEH                  (RegWEH),
+     .WEL                  (RegWEL),
+     .AddrA                (RegAddrA),
+     .AddrB                (RegAddrB),
+     .AddrC                (RegAddrC),
+     .DIH                  (RegDIH),
+     .DIL                  (RegDIL),
+     .DOAH                 (RegBusA[15:8]),
+     .DOAL                 (RegBusA[7:0]),
+     .DOBH                 (RegBusB[15:8]),
+     .DOBL                 (RegBusB[7:0]),
+     .DOCH                 (RegBusC[15:8]),
+     .DOCL                 (RegBusC[7:0])
+     );
+
+  //-------------------------------------------------------------------------
+  //
+  // Buses
+  //
+  //-------------------------------------------------------------------------
+
+  // Compute BusA/BusB combinationally and then register.
+  // This avoids stale write data when `dout` is updated in the same clock edge:
+  // with separate posedge blocks, `dout <= BusB` can observe the previous BusB
+  // value due to nonblocking update ordering (breaks PUSH/POP timing in DMG boot).
+  reg [7:0] BusB_next;
+  reg [7:0] BusA_next;
+
+  always @* begin
+    case (Set_BusB_To)
+      4'b0111 :
+        BusB_next = ACC;
+      4'b0000 , 4'b0001 , 4'b0010 , 4'b0011 , 4'b0100 , 4'b0101 :
+        BusB_next = Set_BusB_To[0] ? RegBusB[7:0] : RegBusB[15:8];
+      4'b0110 :
+        BusB_next = DI_Reg;
+      4'b1000 :
+        BusB_next = SP[7:0];
+      4'b1001 :
+        BusB_next = SP[15:8];
+      4'b1010 :
+        BusB_next = 8'b00000001;
+      4'b1011 :
+        // In GameBoy mode (Mode==3), F[3:0] must always read as 0
+        BusB_next = (Mode == 3) ? {F[7:4], 4'b0000} : F;
+      4'b1100 :
+        BusB_next = PC[7:0];
+      4'b1101 :
+        BusB_next = PC[15:8];
+      4'b1110 :
+        BusB_next = 8'b00000000;
+      default :
+        BusB_next = 8'h00;
+    endcase
+
+    // Fix: For INC r/DEC r during M1/T3, use Set_BusA_To (now correct based on new IR).
+    // At T3, IR has been updated (at T2 edge), so Set_BusA_To is valid.
+    // We explicitly select the register byte using Set_BusA_To[0] from the new microcode output.
+    if (tstate[3] && mcycle[0] && inc_dec_r_ir)
+      // Use Set_BusA_To[0] for byte selection (1=low byte, 0=high byte)
+      BusA_next = Set_BusA_To[0] ? RegBusA[7:0] : RegBusA[15:8];
+    else
+      case (Set_BusA_To)
+        4'b0111 :
+          BusA_next = ACC;
+        4'b0000 , 4'b0001 , 4'b0010 , 4'b0011 , 4'b0100 , 4'b0101 :
+          BusA_next = Set_BusA_To[0] ? RegBusA[7:0] : RegBusA[15:8];
+        4'b0110 :
+          BusA_next = DI_Reg;
+        4'b1000 :
+          BusA_next = SP[7:0];
+        4'b1001 :
+          BusA_next = SP[15:8];
+        4'b1010 :
+          BusA_next = 8'b00000000;
+        default :
+          BusA_next = 8'h00;
+      endcase
+  end
+
+  // Combinational data output - provides valid data on same cycle as write assertion
+  // This bypasses the registered dout for proper write timing
+  assign dout_next = (I_RLD == 1'b1) ? {BusB_next[3:0], BusA_next[3:0]} :
+                     (I_RRD == 1'b1) ? {BusA_next[3:0], BusB_next[7:4]} :
+                     BusB_next;
+
+  always @ (posedge clk) begin
+    BusB <= `TV80DELAY BusB_next;
+    BusA <= `TV80DELAY BusA_next;
+  end
+
+  // (BusA register update moved above)
+
+  //-------------------------------------------------------------------------
+  //
+  // Generate external control signals
+  //
+  //-------------------------------------------------------------------------
+`ifdef TV80_REFRESH
+  always @ (posedge clk or negedge reset_n)
+    begin
+      if (reset_n == 1'b0 ) 
+        begin
+          rfsh_n <= `TV80DELAY 1'b1;
+        end 
+      else
+        begin
+          if (cen == 1'b1 ) 
+            begin
+              if (mcycle[0] && ((tstate[2]  && wait_n == 1'b1) || tstate[3]) ) 
+                begin
+                  rfsh_n <= `TV80DELAY 1'b0;
+                end 
+              else 
+                begin
+                  rfsh_n <= `TV80DELAY 1'b1;
+                end
+            end
+        end
+    end // always @ (posedge clk or negedge reset_n)
+`else // !`ifdef TV80_REFRESH
+  assign rfsh_n = 1'b1;
+`endif  
+
+  always @(/*AUTOSENSE*/BusAck or Halt_FF or I_DJNZ or IntCycle
+	   or IntE_FF1 or di or iorq_i or mcycle or tstate)
+    begin
+      mc = mcycle;
+      ts = tstate;
+      DI_Reg = di;
+      halt_n = ~ Halt_FF;
+      busak_n = ~ BusAck;
+      intcycle_n = ~ IntCycle;
+      IntE = IntE_FF1;
+      iorq = iorq_i;
+      stop = I_DJNZ;
+    end
+
+  //-----------------------------------------------------------------------
+  //
+  // Syncronise inputs
+  //
+  //-----------------------------------------------------------------------
+
+  always @ (posedge clk or negedge reset_n)
+    begin : sync_inputs
+      if (~reset_n) 
+        begin
+          BusReq_s <= `TV80DELAY 1'b0;
+          INT_s <= `TV80DELAY 1'b0;
+          NMI_s <= `TV80DELAY 1'b0;
+          Oldnmi_n <= `TV80DELAY 1'b0;
+        end 
+      else
+        begin
+          if (cen == 1'b1 ) 
+            begin
+              BusReq_s <= `TV80DELAY ~ busrq_n;
+              INT_s <= `TV80DELAY ~ int_n;
+              if (NMICycle == 1'b1 ) 
+                begin
+                  NMI_s <= `TV80DELAY 1'b0;
+                end 
+              else if (nmi_n == 1'b0 && Oldnmi_n == 1'b1 ) 
+                begin
+                  NMI_s <= `TV80DELAY 1'b1;
+                end
+              Oldnmi_n <= `TV80DELAY nmi_n;
+            end
+        end
+    end
+
+  //-----------------------------------------------------------------------
+  //
+  // Main state machine
+  //
+  //-----------------------------------------------------------------------
+
+  always @ (posedge clk or negedge reset_n)
+    begin
+      if (reset_n == 1'b0 ) 
+        begin
+          mcycle <= `TV80DELAY 7'b0000001;
+          tstate <= `TV80DELAY 7'b0000001;
+          Pre_XY_F_M <= `TV80DELAY 3'b000;
+          Halt_FF <= `TV80DELAY 1'b0;
+          BusAck <= `TV80DELAY 1'b0;
+          NMICycle <= `TV80DELAY 1'b0;
+          IntCycle <= `TV80DELAY 1'b0;
+          IntE_FF1 <= `TV80DELAY 1'b0;
+          IntE_FF2 <= `TV80DELAY 1'b0;
+          EI_Delay <= `TV80DELAY 1'b0;  // GameBoy EI delay init
+          No_BTR <= `TV80DELAY 1'b0;
+          Auto_Wait_t1 <= `TV80DELAY 1'b0;
+          Auto_Wait_t2 <= `TV80DELAY 1'b0;
+          m1_n <= `TV80DELAY 1'b1;
+        end 
+      else
+        begin
+          if (cen == 1'b1 ) 
+            begin
+              if (T_Res == 1'b1 ) 
+                begin
+                  Auto_Wait_t1 <= `TV80DELAY 1'b0;
+                end 
+              else 
+                begin
+		  Auto_Wait_t1 <= `TV80DELAY Auto_Wait || (iorq_i & ~Auto_Wait_t2);
+                end
+              Auto_Wait_t2 <= `TV80DELAY Auto_Wait_t1 & !T_Res;
+              No_BTR <= `TV80DELAY (I_BT && (~ IR[4] || ~ F[Flag_P])) ||
+                        (I_BC && (~ IR[4] || F[Flag_Z] || ~ F[Flag_P])) ||
+                        (I_BTR && (~ IR[4] || F[Flag_Z]));
+              if (tstate[2] ) 
+                begin
+                  if (SetEI == 1'b1 ) 
+                    begin
+                      if (!NMICycle)
+                        IntE_FF1 <= `TV80DELAY 1'b1;
+                      IntE_FF2 <= `TV80DELAY 1'b1;
+                    end
+                  if (I_RETN == 1'b1 ) 
+                    begin
+                      IntE_FF1 <= `TV80DELAY IntE_FF2;
+                    end
+                end
+              if (tstate[3] ) 
+                begin
+                  if (SetDI == 1'b1 ) 
+                    begin
+                      IntE_FF1 <= `TV80DELAY 1'b0;
+                      IntE_FF2 <= `TV80DELAY 1'b0;
+                    end
+                end
+              if (IntCycle == 1'b1 || NMICycle == 1'b1 ) 
+                begin
+                  Halt_FF <= `TV80DELAY 1'b0;
+                end
+              if (mcycle[0] && tstate[2] && wait_n == 1'b1 ) 
+                begin
+                  m1_n <= `TV80DELAY 1'b1;
+                end
+              if (BusReq_s == 1'b1 && BusAck == 1'b1 ) 
+                begin
+                end 
+              else 
+                begin
+                  BusAck <= `TV80DELAY 1'b0;
+                  if (tstate[2] && wait_n == 1'b0 ) 
+                    begin
+                    end 
+                  else if (T_Res == 1'b1 ) 
+                    begin
+                      if (Halt == 1'b1 ) 
+                        begin
+                          Halt_FF <= `TV80DELAY 1'b1;
+                        end
+                      if (BusReq_s == 1'b1 ) 
+                        begin
+                          BusAck <= `TV80DELAY 1'b1;
+                        end 
+                      else 
+                        begin
+                          tstate <= `TV80DELAY 7'b0000010;
+                          if (NextIs_XY_Fetch == 1'b1 ) 
+                            begin
+                              mcycle <= `TV80DELAY 7'b0100000;
+                              Pre_XY_F_M <= `TV80DELAY mcyc_to_number(mcycle);
+                              if (IR == 8'b00110110 && Mode == 0 ) 
+                                begin
+                                  Pre_XY_F_M <= `TV80DELAY 3'b010;
+                                end
+                            end 
+                          else if ((mcycle[6]) || (mcycle[5] && Mode == 1 && ISet != 2'b01) ) 
+                            begin
+                              mcycle <= `TV80DELAY number_to_bitvec(Pre_XY_F_M + 1);
+                            end 
+                          // GameBoy IntCycle fix: When IntCycle or NMICycle starts, the mcycles register
+                          // still has the old value (from previous instruction). This causes last_mcycle
+                          // to be TRUE at M1 even though IntCycle needs 5 M-cycles. Skip last_mcycle
+                          // check when IntCycle/NMICycle is active and we're in M1 (first cycle).
+                          else if ((last_mcycle && !((IntCycle || NMICycle) && mcycle[0])) ||
+                                   No_BTR == 1'b1 ||
+                                   (mcycle[1] && I_DJNZ == 1'b1 && IncDecZ == 1'b1) )
+                            begin
+                              m1_n <= `TV80DELAY 1'b0;
+                              mcycle <= `TV80DELAY 7'b0000001;
+                              IntCycle <= `TV80DELAY 1'b0;
+                              NMICycle <= `TV80DELAY 1'b0;
+                              // Note: EI_Delay removed - SetEI check already provides 1-instruction delay
+                              // SetEI is 1 during EI instruction execution, blocking immediate interrupt
+                              // At end of next instruction, SetEI is 0, allowing interrupt to fire
+                              if (NMI_s == 1'b1 && Prefix == 2'b00 )
+                                begin
+                                  NMICycle <= `TV80DELAY 1'b1;
+                                  IntE_FF1 <= `TV80DELAY 1'b0;
+                                end
+                              // GameBoy: SetEI check enforces one-instruction delay after EI
+                              // If currently executing EI (SetEI=1), don't trigger interrupt yet
+                              else if ((IntE_FF1 == 1'b1 && INT_s == 1'b1) && Prefix == 2'b00 && SetEI == 1'b0)
+                                begin
+                                  IntCycle <= `TV80DELAY 1'b1;
+                                  IntE_FF1 <= `TV80DELAY 1'b0;
+                                  IntE_FF2 <= `TV80DELAY 1'b0;
+                                end
+                            end 
+                          else 
+                            begin
+                              mcycle <= `TV80DELAY { mcycle[5:0], mcycle[6] };
+                            end
+                        end
+                    end 
+                  else 
+                    begin   // verilog has no "nor" operator
+                      if ( ~(Auto_Wait == 1'b1 && Auto_Wait_t2 == 1'b0) &&
+                           ~(IOWait == 1 && iorq_i == 1'b1 && Auto_Wait_t1 == 1'b0) ) 
+                        begin
+                          tstate <= `TV80DELAY { tstate[5:0], tstate[6] };
+                        end
+                    end
+                end
+              if (tstate[0]) 
+                begin
+                  m1_n <= `TV80DELAY 1'b0;
+                end
+            end
+        end
+    end
+
+  always @(/*AUTOSENSE*/BTR_r or DI_Reg or IncDec_16 or JumpE or PC
+	   or RegBusA or RegBusC or SP or tstate)
+    begin
+      if (JumpE == 1'b1 )
+        begin
+          // Relative jump offset for JR (and DJNZ in Z80 modes).
+          // In GameBoy mode (Mode=3), PC already points to next instruction (PC+2),
+          // so use the signed offset directly. In Z80 modes, keep legacy -1 compensation.
+          if (Mode == 3)
+            PC16_B = { {8{DI_Reg[7]}}, DI_Reg };
+          else
+            PC16_B = { {8{DI_Reg[7]}}, DI_Reg } - 1;
+        end
+      else if (BTR_r == 1'b1 )
+        begin
+          PC16_B = -2;
+        end
+      else
+        begin
+          PC16_B = 1;
+        end
+
+      if (tstate[3])
+        begin
+          SP16_A = RegBusC;
+          SP16_B = { {8{DI_Reg[7]}}, DI_Reg };
+        end
+      else
+        begin
+          // suspect that ID16 and SP16 could be shared
+          SP16_A = SP;
+          
+          if (IncDec_16[3] == 1'b1)
+            SP16_B = -1;
+          else
+            SP16_B = 1;
+        end
+
+      if (IncDec_16[3])  
+        ID16_B = -1;
+      else
+        ID16_B = 1;
+
+      ID16 = RegBusA + ID16_B;
+      PC16 = PC + PC16_B;
+      SP16 = SP16_A + SP16_B;
+    end // always @ *
+  
+
+  always @(/*AUTOSENSE*/IntCycle or NMICycle or mcycle)
+    begin
+      Auto_Wait = 1'b0;
+      if (IntCycle == 1'b1 || NMICycle == 1'b1 ) 
+        begin
+          if (mcycle[0] ) 
+            begin
+              Auto_Wait = 1'b1;
+            end
+        end
+    end // always @ *
+  
+endmodule // T80

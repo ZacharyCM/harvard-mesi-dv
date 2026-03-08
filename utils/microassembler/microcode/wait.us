@@ -1,0 +1,40 @@
+// Copyright Jamie Iles, 2017
+//
+// This file is part of s80x86.
+//
+// s80x86 is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// s80x86 is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with s80x86.  If not, see <http://www.gnu.org/licenses/>.
+
+// FWAIT (WAIT) instruction - Full implementation with FPU polling
+// Polls FPU BUSY pin, then checks ERROR pin, triggers INT 16 on error
+.at 0x9b;
+    jmp fwait_poll_busy;
+
+.auto_address;
+fwait_poll_busy:
+    // Poll the FPU BUSY pin - loop here while FPU is busy
+    // ext_int_yield allows interrupts to be serviced while waiting
+    jmp_if_fpu_busy fwait_poll_busy, ext_int_yield;
+
+fwait_check_error:
+    // FPU is no longer busy - check ERROR pin
+    // If fpu_int (ERROR pin) is asserted, jump to exception handler
+    jmp_if_fpu_error fpu_exception;
+    // No error - complete instruction
+    next_instruction;
+
+fpu_exception:
+    // FPU exception detected via ERROR pin
+    // Trigger INT 16 (0x10) - coprocessor error interrupt
+    b_sel IMMEDIATE, immediate 0x10, alu_op SELB, tmp_wr_en, jmp do_int;
+

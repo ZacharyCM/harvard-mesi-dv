@@ -1,0 +1,122 @@
+// Copyright Jamie Iles, 2017
+//
+// This file is part of s80x86.
+//
+// s80x86 is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// s80x86 is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with s80x86.  If not, see <http://www.gnu.org/licenses/>.
+
+#include <config.h>
+
+.at 0xd8;
+    mar_write, mar_wr_sel EA, jmp do_esc;
+.at 0xd9;
+    mar_write, mar_wr_sel EA, jmp_dispatch_reg dispatch_d9;
+.at 0xda;
+    mar_write, mar_wr_sel EA, jmp do_esc;
+.at 0xdb;
+    mar_write, mar_wr_sel EA, jmp do_esc;
+.at 0xdc;
+    mar_write, mar_wr_sel EA, jmp do_esc;
+.at 0xdd;
+    mar_write, mar_wr_sel EA, jmp_dispatch_reg dispatch_dd;
+.at 0xde;
+    mar_write, mar_wr_sel EA, jmp do_esc;
+.at 0xdf;
+    mar_write, mar_wr_sel EA, jmp_dispatch_reg dispatch_df;
+
+.auto_address;
+
+// D9 Dispatch Table (FLD/FST/FLDCW/FSTCW/etc)
+dispatch_d9:
+    jmp do_esc;          // reg == 0: FLD single precision
+    jmp do_esc;          // reg == 1: Reserved
+    jmp do_esc;          // reg == 2: FST single precision
+    jmp do_esc;          // reg == 3: FSTP single precision
+    jmp do_esc;          // reg == 4: FLDENV
+    jmp_rm_reg_mem do_fldcw_reg;  // reg == 5: FLDCW [mem] (load control word from memory)
+    jmp do_esc;          // reg == 6: FSTENV
+    jmp_rm_reg_mem do_fstcw_reg;  // reg == 7: FSTCW [mem] (store control word to memory)
+
+do_fldcw_reg:
+    // FLDCW [mem] - D9 /5
+    // Load FPU control word from memory (16-bit)
+    // Memory already addressed by mar_write in D9 handler
+    width W16, segment DS, mem_read;                // Read 16-bit from memory to MDR
+    a_sel MDR, alu_op SELA, mdr_write,              // Move MDR through ALU to Q
+        fpu_ctrl_wr, next_instruction;              // Write Q to FPU control word register
+
+do_fstcw_reg:
+    // FSTCW [mem] - D9 /7
+    // Store FPU control word to memory (16-bit)
+    // Memory already addressed by mar_write in D9 handler
+    a_sel FPU_CONTROL, alu_op SELA, mdr_write;      // Read control word to A-bus, write to MDR
+    width W16, segment DS, mem_write, next_instruction;  // Write MDR to memory (16-bit)
+
+// DD Dispatch Table (FLD/FST/FSTSW double precision)
+dispatch_dd:
+    jmp do_esc;          // reg == 0: FLD double precision
+    jmp do_esc;          // reg == 1: Reserved
+    jmp do_esc;          // reg == 2: FST double precision
+    jmp do_esc;          // reg == 3: FSTP double precision
+    jmp do_esc;          // reg == 4: FRSTOR
+    jmp do_esc;          // reg == 5: Reserved
+    jmp do_esc;          // reg == 6: FSAVE
+    jmp_rm_reg_mem do_fstsw_mem_reg;  // reg == 7: FSTSW [mem] (store status word to memory)
+
+do_fstsw_mem_reg:
+    // FSTSW [mem] - DD /7
+    // Store FPU status word to memory (16-bit)
+    // Memory already addressed by mar_write in DD handler
+    a_sel FPU_STATUS, alu_op SELA, mdr_write;       // Read status word to A-bus, write to MDR
+    width W16, segment DS, mem_write, next_instruction;  // Write MDR to memory (16-bit)
+
+// DF Dispatch Table (FILD/FIST/FBLD/FBSTP/FSTSW)
+dispatch_df:
+    jmp do_esc;          // reg == 0: FILD word integer
+    jmp do_esc;          // reg == 1: Reserved
+    jmp do_esc;          // reg == 2: FIST word integer
+    jmp do_esc;          // reg == 3: FISTP word integer
+    jmp_rm_reg_mem do_fstsw_ax_mem;  // reg == 4: FSTSW AX (E0) or FSTSW [mem] (other)
+    jmp do_esc;          // reg == 5: FILD qword integer
+    jmp do_esc;          // reg == 6: FBSTP packed BCD
+    jmp do_esc;          // reg == 7: FISTP qword integer
+
+do_fstsw_ax_mem:
+    // FSTSW [mem] - DF /4 with memory operand
+    // Store FPU status word to memory (16-bit)
+    // Memory already addressed by mar_write in DF handler
+    a_sel FPU_STATUS, alu_op SELA, mdr_write;       // Read status word to A-bus, write to MDR
+    width W16, segment DS, mem_write, next_instruction;  // Write MDR to memory (16-bit)
+
+do_fstsw_ax_reg:
+    // FSTSW AX - DF E0
+    // Store FPU status word in AX register
+    // Read FPU status word from A-bus, write to AX
+    a_sel FPU_STATUS, alu_op SELA,
+        rd_sel_source MICROCODE_RD_SEL, rd_sel AX,
+        next_instruction;
+
+do_esc:
+#if (S80X86_TRAP_ESCAPE == 1)
+    b_sel IMMEDIATE, immediate 0x1c, alu_op SELB, tmp_wr_en, jmp do_int;
+#else
+    // FPU ESC instructions (D8-DF) - Asynchronous coprocessor operation
+    // Hardware signals in Core.sv:
+    //   - fpu_opcode (output to FPU) - ESC opcode
+    //   - fpu_modrm (output to FPU) - ModR/M byte
+    //   - fpu_instr_valid (output to FPU) - Pulse when new ESC detected
+    //   - fpu_busy (input from FPU) - FPU executing (does NOT stall CPU)
+    // CPU and FPU work concurrently - CPU continues executing while FPU processes
+    // Use FWAIT instruction to synchronize (waits for fpu_busy to clear)
+    next_instruction;
+#endif

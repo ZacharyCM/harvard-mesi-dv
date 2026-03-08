@@ -1,0 +1,175 @@
+//
+// TV80-based GameBoy CPU wrapper
+// Replaces VHDL GBse/T80 with Verilog TV80
+//
+// This module provides a drop-in replacement for the GBse module
+// used in the MiSTer GameBoy core, using the TV80 Z80 Verilog core
+// instead of the VHDL T80 core.
+//
+// Mode 3 = GameBoy (LR35902) - modified Z80 without IX/IY registers
+//
+// Copyright (c) 2024 - MIT License
+//
+
+module GBse #(
+    parameter T2Write = 2,  // 0 => WR_n active in T3, 1 => WR_n active in T2, Other => WR_n active in T2+T3
+    parameter IOWait = 1    // 0 => Single cycle I/O, 1 => Std I/O cycle
+) (
+    input         RESET_n,
+    input         CLK_n,
+    input         CLKEN,
+    input         WAIT_n,
+    input         INT_n,
+    input         NMI_n,
+    input         BUSRQ_n,
+    output        M1_n,
+    output reg    MREQ_n,
+    output reg    IORQ_n,
+    output reg    RD_n,
+    output reg    WR_n,
+    output        RFSH_n,
+    output        HALT_n,
+    output        BUSAK_n,
+    output        STOP,
+    output [15:0] A,
+    input  [7:0]  DI,
+    output [7:0]  DO,
+    input         isGBC,
+    // Savestate interface (stubbed for now)
+    input  [63:0] SaveStateBus_Din,
+    input  [9:0]  SaveStateBus_Adr,
+    input         SaveStateBus_wren,
+    input         SaveStateBus_rst,
+    output [63:0] SaveStateBus_Dout
+);
+
+    // Internal signals
+    wire        intcycle_n;
+    wire        no_read;
+    wire        write;
+    wire        iorq;
+    reg  [7:0]  di_reg;
+    reg         wait_n_prev;
+    wire [6:0]  mcycle;
+    wire [6:0]  tstate;
+    wire [7:0]  dout_next;  // Combinational data output for proper write timing
+
+    // Stub savestate output (not implemented in TV80)
+    assign SaveStateBus_Dout = 64'b0;
+
+    // Use combinational dout_next for DO - ensures valid data during write cycles
+    assign DO = dout_next;
+
+    // Instantiate TV80 core with GameBoy mode
+    tv80_core #(
+        .Mode(3),           // GameBoy mode (LR35902)
+        .IOWait(IOWait)
+    ) i_tv80_core (
+        .cen        (CLKEN),
+        .m1_n       (M1_n),
+        .iorq       (iorq),
+        .no_read    (no_read),
+        .write      (write),
+        .rfsh_n     (RFSH_n),
+        .halt_n     (HALT_n),
+        .wait_n     (WAIT_n),
+        .int_n      (INT_n),
+        .nmi_n      (NMI_n),
+        .reset_n    (RESET_n),
+        .busrq_n    (BUSRQ_n),
+        .busak_n    (BUSAK_n),
+        .clk        (CLK_n),
+        .IntE       (),
+        .stop       (STOP),
+        .A          (A),
+        .dinst      (DI),
+        .di         (di_reg),
+        .dout       (),           // Not used - using dout_next for proper write timing
+        .dout_next  (dout_next),  // Combinational output for writes
+        .mc         (mcycle),
+        .ts         (tstate),
+        .intcycle_n (intcycle_n)
+    );
+
+    // Control signal generation (matches T80/GBse timing)
+    // This logic is adapted from tv80s.v with CLKEN support
+    always @(posedge CLK_n or negedge RESET_n) begin
+        if (!RESET_n) begin
+            RD_n   <= 1'b1;
+            WR_n   <= 1'b1;
+            IORQ_n <= 1'b1;
+            MREQ_n <= 1'b1;
+            di_reg <= 8'h00;
+            wait_n_prev <= 1'b1;
+        end
+        else begin
+            // IMPORTANT: Control signals must be updated on EVERY clock edge,
+            // not just when CLKEN=1. The CPU core gates internal state changes
+            // with CLKEN, but bus control signals need continuous updates.
+            RD_n   <= 1'b1;
+            WR_n   <= 1'b1;
+            IORQ_n <= 1'b1;
+            MREQ_n <= 1'b1;
+
+            if (mcycle[0]) begin
+                // M1 cycle (instruction fetch)
+                if (tstate[1] || tstate[2]) begin
+                    RD_n   <= ~intcycle_n;
+                    MREQ_n <= ~intcycle_n;
+                end
+                if (tstate[3]) begin
+                    MREQ_n <= 1'b0;
+                end
+            end
+            else if (mcycle[2] && intcycle_n == 1'b0) begin
+                // Interrupt acknowledge cycle
+                if (tstate[2]) begin
+                    IORQ_n <= 1'b0;
+                end
+            end
+            else begin
+                // Memory/IO read
+                if ((tstate[1] || tstate[2]) && no_read == 1'b0 && write == 1'b0) begin
+                    RD_n   <= 1'b0;
+                    IORQ_n <= ~iorq;
+                    MREQ_n <= iorq;
+                end
+
+                // Memory/IO write - T2Write timing variants
+                if (T2Write == 0) begin
+                    if (tstate[2] && write == 1'b1) begin
+                        WR_n   <= 1'b0;
+                        IORQ_n <= ~iorq;
+                        MREQ_n <= iorq;
+                    end
+                end
+                else if (T2Write == 1) begin
+                    if ((tstate[1] || (tstate[2] && WAIT_n == 1'b0)) && write == 1'b1) begin
+                        WR_n   <= 1'b0;
+                        IORQ_n <= ~iorq;
+                        MREQ_n <= iorq;
+                    end
+                end
+                else begin
+                    // T2Write == 2 or other (default for GameBoy)
+                    if ((tstate[1] || tstate[2]) && write == 1'b1) begin
+                        WR_n   <= 1'b0;
+                        IORQ_n <= ~iorq;
+                        MREQ_n <= iorq;
+                    end
+                end
+            end
+
+            // Data input register latch
+            // Latch at T2 during READ cycles when CPU advances,
+            // and also once on WAIT_n rising edge to pre-latch data
+            // before CLKEN resumes after SDRAM wait.
+            if ((CLKEN || (!wait_n_prev && WAIT_n)) &&
+                tstate[2] && WAIT_n == 1'b1 && !write && !no_read) begin
+                di_reg <= DI;
+            end
+            wait_n_prev <= WAIT_n;
+        end
+    end
+
+endmodule
