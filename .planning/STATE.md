@@ -1,8 +1,36 @@
 # STATE.md — Project Memory
 
 ## Current Status
-- Phase: 0 (Planning complete, Phase 1 not started)
+- Phase: 1 COMPLETE — commit f7e8d0d0 on main
+- Next: Phase 2 — Snoop Port Injection
 - Milestone: 1
+
+## Phase 1 Summary (DONE)
+Added 2-bit MESI state arrays to both caches. Local transitions only:
+- ICache2Way: fill→E, invalidation→I (mesi_way0[], mesi_way1[])
+- DCache2Way: fill→E, write hit→M, flush done→I (mesi_way0[], mesi_way1[])
+- MESI encoding: I=2'b00, S=2'b01, E=2'b10, M=2'b11
+- Used localparams (not typedef enum) for Icarus Verilog compatibility
+- Separate mesi_way0[] and mesi_way1[] arrays (not 2D) for Icarus compat
+- DCache2Way MESI block added as standalone always_ff before endmodule
+- Note: DPRam.sv has pre-existing forward-declaration issue with Icarus v13 on macOS
+  (not caused by our changes — tests designed for Linux Icarus v11)
+
+## Phase 2 Plan (NEXT)
+Goal: Add snoop input ports to ICache2Way and DCache2Way.
+When snoop_valid fires with a matching write address → invalidate that line THIS cycle (combinational).
+
+New ports to add to BOTH caches:
+  input  logic        snoop_valid     // snoop transaction on bus this cycle
+  input  logic [19:1] snoop_addr      // address being snooped
+  input  logic        snoop_is_write  // 1=write (invalidating), 0=read (sharing)
+  output logic        snoop_hit       // this cache has the snooped line
+
+Key constraint: invalidation must be COMBINATIONAL (same cycle as snoop_valid)
+MESI state update can be registered (next posedge).
+
+Files to modify: ICache2Way.sv, DCache2Way.sv
+New files: none yet (SnoopArbiter is Phase 3)
 
 ## Repo Baseline (what we found)
 
