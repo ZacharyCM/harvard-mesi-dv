@@ -95,6 +95,35 @@ module DCache2Way(
 parameter sets = 256;  // 256 sets × 2 ways = 512 lines (same as direct-mapped)
 parameter bit DEBUG = 0;
 
+// ============================================================================
+// MESI COHERENCE STATE - Phase 1
+//
+// CS analogy: imagine every cache line is a shared Google Doc.
+//   I = nobody has it open
+//   S = multiple people have it open, read-only
+//   E = only you have it open, and you haven't changed it yet
+//   M = only you have it open, and you've made edits (unsaved to memory)
+//
+// The hardware must ensure that if you have an M line and someone else tries
+// to read it, they get YOUR version, not the stale copy in memory.
+// That's what the snoop bus (Phase 2+) enforces.
+//
+// Encoding:
+//   I = 2'b00  Invalid   - line absent from this cache
+//   S = 2'b01  Shared    - clean, multiple caches may have it
+//   E = 2'b10  Exclusive - clean, only this cache has it
+//   M = 2'b11  Modified  - dirty, only this cache has it (memory is stale)
+// ============================================================================
+localparam MESI_I = 2'b00;
+localparam MESI_S = 2'b01;
+localparam MESI_E = 2'b10;
+localparam MESI_M = 2'b11;
+
+// One 2-bit MESI state per set per way.
+// Two separate 1D arrays for Icarus Verilog compatibility.
+logic [1:0] mesi_way0 [0:sets-1];
+logic [1:0] mesi_way1 [0:sets-1];
+
 localparam line_size = 8;
 localparam index_bits = $clog2(sets);  // 8 bits for 256 sets
 localparam tag_bits = 19 - 3 - index_bits;  // 10 bits
@@ -1215,6 +1244,91 @@ always_ff @(posedge clk or posedge reset) begin
                 debug_printed <= 1'b1;
             end
         end
+    end
+end
+
+// ============================================================================
+// MESI STATE MACHINE - Phase 1 (local transitions only, no snoop yet)
+//
+// This block runs independently of all existing cache logic.
+// It watches the same event signals the rest of the cache uses and
+// updates the mesi_way0/mesi_way1 arrays accordingly.
+//
+// Phase 1 handles only LOCAL state changes:
+//   - Reset                  → I  (nothing cached)
+//   - Cache line filled       → E  (we fetched it, nobody else has it yet)
+//   - CPU writes to a hit     → M  (we modified it, memory is now stale)
+//   - Line evicted (flush)    → I  (line is gone from this cache)
+//
+// Phase 2 will add SNOOP transitions:
+//   - Another core writes our S/E line  → I  (invalidated)
+//   - Another core reads our M line     → S  (after writeback)
+//   - We read a line another core has   → S  (both go Shared)
+// ============================================================================
+integer mesi_i;
+
+always_ff @(posedge clk or posedge reset) begin
+    if (reset) begin
+        // Initialize all lines to Invalid — nothing is cached at power-on
+        for (mesi_i = 0; mesi_i < sets; mesi_i = mesi_i + 1) begin
+            mesi_way0[mesi_i] <= MESI_I;
+            mesi_way1[mesi_i] <= MESI_I;
+        end
+    end else begin
+
+        // ------------------------------------------------------------------
+        // EVENT 1: Fill complete → Exclusive
+        //
+        // We just loaded a full cache line (all 8 words) from memory.
+        // Since no other cache has been told about this, we're the only
+        // owner → Exclusive. Like downloading a file nobody else has yet.
+        //
+        // Condition: last word of fill acknowledged, not a flush operation
+        // ------------------------------------------------------------------
+        if (~flushing_active && line_idx == 3'b111 && m_ack) begin
+            if (selected_way == 1'b0)
+                mesi_way0[latched_address[index_end:index_start]] <= MESI_E;
+            else
+                mesi_way1[latched_address[index_end:index_start]] <= MESI_E;
+        end
+
+        // ------------------------------------------------------------------
+        // EVENT 2: Write hit → Modified
+        //
+        // CPU wrote to a line that was already in cache (a hit).
+        // The cache now holds data that memory does NOT have.
+        // → Modified. Like editing a doc without clicking Save.
+        //
+        // E → M : we owned it exclusively, now it's dirty
+        // S → M : we were sharing it (Phase 2: must broadcast invalidate first)
+        // M → M : already dirty, stays dirty
+        //
+        // Note: we use c_addr for the index here because the write is happening
+        // to the current CPU address, not the latched fill address.
+        // ------------------------------------------------------------------
+        if (c_ack && c_wr_en) begin
+            if (hit_way0)
+                mesi_way0[c_addr[index_end:index_start]] <= MESI_M;
+            if (hit_way1)
+                mesi_way1[c_addr[index_end:index_start]] <= MESI_M;
+        end
+
+        // ------------------------------------------------------------------
+        // EVENT 3: Flush done → Invalid
+        //
+        // A dirty cache line just finished writing back to memory (eviction).
+        // The line is gone from the cache → Invalid.
+        // Like closing a saved document — it's in storage now, not in RAM.
+        //
+        // flush_way_reg and flush_index_reg track which line was being flushed.
+        // ------------------------------------------------------------------
+        if (flush_done) begin
+            if (flush_way_reg == 1'b0)
+                mesi_way0[flush_index_reg] <= MESI_I;
+            else
+                mesi_way1[flush_index_reg] <= MESI_I;
+        end
+
     end
 end
 

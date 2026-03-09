@@ -44,6 +44,32 @@ module ICache2Way(
 
 parameter sets = 256;
 
+// ============================================================================
+// MESI COHERENCE STATE - Phase 1
+//
+// CS analogy: think of this as adding a 2-bit "ownership tag" to every slot
+// in our cache hash map. Instead of just valid/invalid, each line now knows
+// whether it's exclusively owned, shared with another cache, or modified.
+//
+// Encoding:
+//   I = 2'b00  Invalid   - line not present (like a null pointer)
+//   S = 2'b01  Shared    - multiple caches may have this (like a read lock)
+//   E = 2'b10  Exclusive - only we have it, data matches memory (like an owned ref)
+//   M = 2'b11  Modified  - only we have it, data is dirty (like unsaved changes)
+//
+// ICache is read-only so we only use I and E locally.
+// S transitions are added in Phase 2 when snooping is wired up.
+// ============================================================================
+localparam MESI_I = 2'b00;
+localparam MESI_S = 2'b01;
+localparam MESI_E = 2'b10;
+localparam MESI_M = 2'b11;
+
+// One 2-bit MESI state per cache line per way.
+// Two separate 1D arrays (Icarus Verilog does not support 2D packed arrays well).
+logic [1:0] mesi_way0 [0:sets-1];
+logic [1:0] mesi_way1 [0:sets-1];
+
 localparam line_size = 8;
 localparam index_bits = $clog2(sets);
 localparam tag_bits = 19 - 3 - index_bits;
@@ -298,6 +324,14 @@ always_ff @(posedge clk or posedge reset) begin
         line_valid[c_m_addr[3:1]] <= 1'b1;
         if (line_idx == 3'b111) begin
             busy <= 1'b0;
+            // MESI: fill complete → Exclusive.
+            // We just fetched this line from memory and no other cache has it yet.
+            // E means: "I'm the only copy, and it matches memory."
+            // (Becomes S in Phase 2 if the snoop bus tells us someone else also has it.)
+            if (selected_way == 1'b0)
+                mesi_way0[latched_address[index_end:index_start]] <= MESI_E;
+            else
+                mesi_way1[latched_address[index_end:index_start]] <= MESI_E;
         end
     end else if (enabled && do_fill) begin
         fill_line();
@@ -313,13 +347,23 @@ always_ff @(posedge clk or posedge reset) begin
             dir_valid_way1[di] <= 1'b0;
             dir_tag_way0[di]   <= { (tag_bits){1'b0} };
             dir_tag_way1[di]   <= { (tag_bits){1'b0} };
+            // MESI reset: all lines start Invalid (nothing cached yet)
+            mesi_way0[di] <= MESI_I;
+            mesi_way1[di] <= MESI_I;
         end
     end else begin
         // Coherence invalidation clears directory valids.
-        if (coh_hit_way0)
+        // MESI: also transition affected way to Invalid.
+        // This fires when DCache writes to an address that ICache currently holds.
+        // The ICache can't keep stale instructions — it must invalidate.
+        if (coh_hit_way0) begin
             dir_valid_way0[coh_idx] <= 1'b0;
-        if (coh_hit_way1)
+            mesi_way0[coh_idx] <= MESI_I;
+        end
+        if (coh_hit_way1) begin
             dir_valid_way1[coh_idx] <= 1'b0;
+            mesi_way1[coh_idx] <= MESI_I;
+        end
 
         // Tag updates on fills.
         if (write_tag_way0)
